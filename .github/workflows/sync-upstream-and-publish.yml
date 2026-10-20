@@ -15,11 +15,6 @@ on:
         required: true
         default: main
         type: string
-      image:
-        description: GHCR image name, without a tag
-        required: false
-        default: ""
-        type: string
 
 permissions:
   contents: write
@@ -53,12 +48,14 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Set image name
+      - name: Set GHCR image name
         id: image
-        env:
-          IMAGE_INPUT: ${{ inputs.image }}
         run: |
-          image="${IMAGE_INPUT:-ghcr.io/${GITHUB_REPOSITORY,,}}"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          case "$image" in
+            ghcr.io/*) ;;
+            *) echo "Invalid GHCR image name: $image" >&2; exit 1 ;;
+          esac
           echo "name=${image}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
