@@ -26,6 +26,8 @@ type QoderModel struct {
 	MaxOutputTokens int     `json:"max_output_tokens,omitempty"`
 	MaxInputTokens  int     `json:"max_input_tokens,omitempty"`
 	PriceFactor     float64 `json:"price_factor,omitempty"`
+	// ContextTiers 上游 context_config 的全部档位（如 200K/400K/1M）。
+	ContextTiers []bridge.ContextTier `json:"context_tiers,omitempty"`
 }
 
 type Service struct {
@@ -55,6 +57,13 @@ func (s *Service) LoadRuntimeSettings() {
 		s.bridgePort = settings.Port
 	}
 	s.bridgeToken = settings.BridgeToken
+	// 排队重试参数（控制台可配）：启动时应用，保存设置时再由 handleSaveSettings 热更新
+	bridge.ApplyQueueSettings(settings.QueueMaxRetries, settings.QueueWaitCapSec, settings.QueueWaitDefaultSec)
+}
+
+// ApplyQueueSettings 热更新模型排队重试参数（控制台保存设置后调用，即时生效）。
+func (s *Service) ApplyQueueSettings(maxRetries, waitCapSec, waitDefaultSec int) {
+	bridge.ApplyQueueSettings(maxRetries, waitCapSec, waitDefaultSec)
 }
 
 func (s *Service) EffectiveToken() string {
@@ -129,7 +138,20 @@ func (s *Service) GetStatus() account.Status {
 		activeID = acct.ID
 		apiMode = acct.APIMode
 	}
-	return account.Status{Running: running, Port: s.bridgePort, ActiveAccount: activeID, APIMode: apiMode}
+	// 两区各自的启用账号，供控制台分区展示
+	cnActive, _ := account.GetActiveByRegion(account.RegionCN)
+	globalActive, _ := account.GetActiveByRegion(account.RegionGlobal)
+	st := account.Status{Running: running, Port: s.bridgePort, ActiveAccount: activeID, APIMode: apiMode}
+	if cnActive != nil {
+		st.CNActive = cnActive.ID
+		st.CNActiveName = cnActive.Name
+	}
+	if globalActive != nil {
+		st.GlobalActive = globalActive.ID
+		st.GlobalActiveName = globalActive.Name
+	}
+	st.GlobalRunning = s.globalSrv != nil
+	return st
 }
 
 func (s *Service) StartBridge() error {
@@ -140,8 +162,8 @@ func (s *Service) StartBridge() error {
 	return s.startBridgeWithAccount(acct)
 }
 
-// EnsureBridgeRunning 启动时调用：有激活账号且有 secret 则起桥；
-// 若激活账号无 secret，尝试第一个有 secret 的账号并激活。
+// EnsureBridgeRunning 启动时调用：为 cn / global 各区域确保存在启用账号，
+// 然后启动桥。某区域没有启用账号时，取该区域第一个有 secret 的账号并启用。
 func (s *Service) EnsureBridgeRunning() error {
 	s.bridgeMu.Lock()
 	running := s.bridgeSrv != nil
@@ -150,29 +172,45 @@ func (s *Service) EnsureBridgeRunning() error {
 		return nil
 	}
 
-	if acct, _ := account.GetActive(); acct != nil {
-		if account.HasSecret(acct.ID) {
-			return s.startBridgeWithAccount(acct)
-		}
-		logger.Error("active account %s has no secret file", acct.ID)
-	}
-
 	accounts, err := account.List()
 	if err != nil {
 		return err
 	}
-	for _, a := range accounts {
-		if !account.HasSecret(a.ID) {
-			continue
+
+	// 按区域确保各有一个「启用且有凭证」的账号
+	for _, region := range []account.Region{account.RegionCN, account.RegionGlobal} {
+		if acct, _ := account.GetActiveByRegion(region); acct != nil {
+			if account.HasSecret(acct.ID) {
+				continue
+			}
+			logger.Error("region=%s active account %s has no secret file", region, acct.ID)
 		}
-		logger.Info("auto-activate account with secret: %s", a.Name)
-		if err := s.SetActiveAccount(a.ID); err != nil {
-			logger.Error("auto-activate failed: %v", err)
-			continue
+		// 该区域没有可用启用账号：取第一个有 secret 的并启用
+		for _, a := range accounts {
+			if account.NormalizeRegion(string(a.Region)) != account.NormalizeRegion(string(region)) {
+				continue
+			}
+			if !account.HasSecret(a.ID) {
+				continue
+			}
+			logger.Info("auto-activate %s account with secret: %s", region, a.Name)
+			if err := account.SetActive(a.ID); err != nil {
+				logger.Error("auto-activate failed: %v", err)
+				continue
+			}
+			break
 		}
-		return nil
 	}
-	return fmt.Errorf("no account with usable secret; please OAuth/PAT login in web console")
+
+	// 主桥用 CN 启用账号；没有 CN 账号时退回 global（兼容纯海外部署）
+	acct, _ := account.GetActiveByRegion(account.RegionCN)
+	if acct == nil {
+		acct, _ = account.GetActiveByRegion(account.RegionGlobal)
+	}
+	if acct == nil {
+		return fmt.Errorf("no account with usable secret; please OAuth/PAT login in web console")
+	}
+	return s.startBridgeWithAccount(acct)
 }
 
 func (s *Service) StopBridge() error {
@@ -344,13 +382,17 @@ func (s *Service) buildRegionPool(region account.Region) *bridge.Pool {
 			logger.Error("buildRegionPool(%s): get secret for %s: %v", region, a.Name, err)
 			continue
 		}
-		slot, err := bridge.NewSlotFromSecret(a.ID, a.Name, a.Region, pat)
+		slot, err := bridge.NewSlotFromSecretWithFP(a.ID, a.Name, a.Region, pat, a.CheckinFingerprint)
 		if err != nil {
 			logger.Error("buildRegionPool(%s): account %s unusable, skipped: %v", region, a.Name, err)
 			continue
 		}
 		pool.Add(slot)
-		logger.Info("buildRegionPool(%s): added account %s", region, a.Name)
+		if a.CheckinFingerprint != nil && a.CheckinFingerprint.MachineToken != "" {
+			logger.Info("buildRegionPool(%s): added account %s (modern protocol)", region, a.Name)
+		} else {
+			logger.Info("buildRegionPool(%s): added account %s", region, a.Name)
+		}
 	}
 	pool.LoadState()
 	return pool
@@ -464,6 +506,7 @@ func (s *Service) ListQoderModels() ([]QoderModel, error) {
 			PriceFactor:     m.PriceFactor,
 			ContextWindow:   m.ContextWindow,
 			MaxOutputTokens: m.MaxOutputTokens,
+			ContextTiers:    m.ContextTiers,
 		}
 	}
 	return out, nil
